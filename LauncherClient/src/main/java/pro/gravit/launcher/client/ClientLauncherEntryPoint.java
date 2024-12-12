@@ -11,7 +11,6 @@ import pro.gravit.launcher.core.hasher.HashedDir;
 import pro.gravit.launcher.core.hasher.HashedEntry;
 import pro.gravit.launcher.base.modules.events.PreConfigPhase;
 import pro.gravit.launcher.base.profiles.ClientProfile;
-import pro.gravit.launcher.base.profiles.ClientProfileVersions;
 import pro.gravit.launcher.base.profiles.optional.actions.OptionalAction;
 import pro.gravit.launcher.base.profiles.optional.actions.OptionalActionClassPath;
 import pro.gravit.launcher.base.profiles.optional.actions.OptionalActionClientArgs;
@@ -27,9 +26,9 @@ import pro.gravit.utils.launch.*;
 import javax.crypto.CipherInputStream;
 import java.io.File;
 import java.io.IOException;
-import java.lang.invoke.MethodHandle;
 import java.lang.invoke.MethodHandles;
 import java.lang.invoke.MethodType;
+import java.lang.invoke.MethodHandle;
 import java.net.*;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Path;
@@ -47,6 +46,7 @@ public class ClientLauncherEntryPoint {
 
     private static Launch launch;
     private static ClassLoaderControl classLoaderControl;
+    private static String java8Path;
 
     private static ClientParams readParams(SocketAddress address) throws IOException {
         try (Socket socket = IOHelper.newSocket()) {
@@ -78,6 +78,25 @@ public class ClientLauncherEntryPoint {
     }
 
     private static void realMain(String[] args) throws Throwable {
+        // Парсим аргументы для определения пути Java 8
+        for (String arg : args) {
+            if (arg.startsWith("--java8path=")) {
+                java8Path = arg.substring("--java8path=".length());
+            }
+        }
+        // Если не передан путь к Java8 через аргументы, берем из APPDATA
+        if (java8Path == null) {
+            String appData = System.getenv("APPDATA");
+            if (appData == null || appData.isEmpty()) {
+                // Если APPDATA не найден, задаём дефолтный путь или логируем предупреждение
+                LogHelper.warning("APPDATA not found. Using default hardcoded path for Java 8.");
+                java8Path = "C:\\Users\\DefaultUser\\AppData\\Roaming\\FoxyGame\\updates\\Java8\\bin\\java";
+            } else {
+                java8Path = appData + File.separator + "FoxyGame" + File.separator + "updates" +
+                        File.separator + "Java8" + File.separator + "bin" + File.separator + "java";
+            }
+        }
+
         modulesManager = new ClientModuleManager();
         modulesManager.loadModule(new ClientLauncherCoreModule());
         LauncherConfig.initModules(modulesManager); //INIT
@@ -114,7 +133,6 @@ public class ClientLauncherEntryPoint {
         Path clientDir = Paths.get(params.clientDir);
         Path assetDir = Paths.get(params.assetDir);
 
-        // Verify ClientLauncher sign and classpath
         LogHelper.debug("Verifying ClientLauncher sign and classpath");
         Set<Path> ignoredPath = new HashSet<>();
         List<Path> classpath = resolveClassPath(ignoredPath, clientDir, params.actions, params.profile)
@@ -125,7 +143,6 @@ public class ClientLauncherEntryPoint {
             }
         }
         List<URL> classpathURLs = classpath.stream().map(IOHelper::toURL).collect(Collectors.toList());
-        // Start client with WatchService monitoring
         RequestService service;
         if (params.offlineMode) {
             service = ClientLauncherMethods.initOffline(modulesManager, params);
@@ -158,6 +175,7 @@ public class ClientLauncherEntryPoint {
                 System.load(Paths.get(params.nativesDir).resolve(ClientService.findLibrary(e)).toAbsolutePath().toString());
             }
         }
+
         if (classLoaderConfig == ClientProfile.ClassLoaderConfig.LAUNCHER || classLoaderConfig == ClientProfile.ClassLoaderConfig.MODULE) {
             if(JVMHelper.JVM_VERSION <= 11) {
                 launch = new LegacyLaunch();
@@ -175,13 +193,16 @@ public class ClientLauncherEntryPoint {
         } else {
             throw new UnsupportedOperationException(String.format("Unknown classLoaderConfig %s", classLoaderConfig));
         }
+
         if(profile.hasFlag(ClientProfile.CompatibilityFlags.CLASS_CONTROL_API)) {
             ClientService.classLoaderControl = classLoaderControl;
         }
+
         if(params.lwjglGlfwWayland && profile.hasFlag(ClientProfile.CompatibilityFlags.WAYLAND_USE_CUSTOM_GLFW)) {
             String glfwName = ClientService.findLibrary("glfw_wayland");
             System.setProperty("org.lwjgl.glfw.libname", glfwName);
         }
+
         AuthService.projectName = Launcher.getConfig().projectName;
         AuthService.username = params.playerProfile.username;
         AuthService.uuid = params.playerProfile.uuid;
@@ -195,13 +216,6 @@ public class ClientLauncherEntryPoint {
         try (DirWatcher assetWatcher = new DirWatcher(assetDir, params.assetHDir, assetMatcher, true);
              DirWatcher clientWatcher = new DirWatcher(clientDir, params.clientHDir, clientMatcher, true);
              DirWatcher javaWatcher = params.javaHDir == null ? null : new DirWatcher(javaDir, params.javaHDir, null, true)) {
-            // Verify current state of all dirs
-            //verifyHDir(IOHelper.JVM_DIR, jvmHDir.object, null, digest);
-            //for (OptionalFile s : Launcher.profile.getOptional()) {
-            //    if (params.updateOptional.contains(s)) s.mark = true;
-            //    else hdir.removeR(s.file);
-            //}
-            // Start WatchService, and only then client
             CommonHelper.newThread("Asset Directory Watcher", true, assetWatcher).start();
             CommonHelper.newThread("Client Directory Watcher", true, clientWatcher).start();
             if (javaWatcher != null)
@@ -216,10 +230,6 @@ public class ClientLauncherEntryPoint {
     }
 
     public static void verifyHDir(Path dir, HashedDir hdir, FileNameMatcher matcher, boolean digest, boolean checkExtra) throws IOException {
-        //if (matcher != null)
-        //    matcher = matcher.verifyOnly();
-
-        // Hash directory and compare (ignore update-only matcher entries, it will break offline-mode)
         HashedDir currentHDir = new HashedDir(dir, matcher, true, digest);
         HashedDir.Diff diff = hdir.diff(currentHDir, matcher);
         AtomicReference<String> latestPath = new AtomicReference<>("unknown");
@@ -250,7 +260,7 @@ public class ClientLauncherEntryPoint {
         Stream.Builder<Path> builder = Stream.builder();
         for (String classPathEntry : classPath) {
             Path path = clientDir.resolve(IOHelper.toPath(classPathEntry.replace(IOHelper.CROSS_SEPARATOR, IOHelper.PLATFORM_SEPARATOR)));
-            if (IOHelper.isDir(path)) { // Recursive walking and adding
+            if (IOHelper.isDir(path)) {
                 List<Path> jars = new ArrayList<>(32);
                 IOHelper.walk(path, new ClassPathFileVisitor(jars), false);
                 Collections.sort(jars);
@@ -284,7 +294,10 @@ public class ClientLauncherEntryPoint {
     private static void launch(ClientProfile profile, ClientParams params) throws Throwable {
         // Add client args
         Collection<String> args = new LinkedList<>();
-        if (profile.getVersion().compareTo(ClientProfileVersions.MINECRAFT_1_6_4) >= 0)
+        // Проверяем версии, если profile.getVersion() вернет строку, делаем проверку на наличие подстрок
+        String versionStr = profile.getVersion().toString();
+        boolean isModern = versionStr.compareTo("1.6.4") > 0;
+        if (isModern)
             params.addClientArgs(args);
         else {
             params.addClientLegacyArgs(args);
@@ -304,29 +317,42 @@ public class ClientLauncherEntryPoint {
             }
         }
         LogHelper.debug("Args: " + copy);
-        // Resolve main class and method
+
         modulesManager.invokeEvent(new ClientProcessPreInvokeMainClassEvent(params, profile, args));
-        // Invoke main method
-        try {
-            {
-                List<String> compatClasses = profile.getCompatClasses();
-                for (String e : compatClasses) {
-                    Class<?> clazz = classLoaderControl.getClass(e);
-                    MethodHandle runMethod = MethodHandles.lookup().findStatic(clazz, "run", MethodType.methodType(void.class, ClassLoaderControl.class));
-                    runMethod.invoke(classLoaderControl);
-                }
-            }
-            Launcher.LAUNCHED.set(true);
-            JVMHelper.fullGC();
-            launch.launch(params.profile.getMainClass(), params.profile.getMainModule(), args);
+
+        // Определяем, нужно ли использовать Java 8
+        boolean useJava8 = versionStr.contains("1.7.10") || versionStr.contains("1.12.2");
+
+        // Путь к Java 21 (текущая)
+        String java21Path = System.getProperty("java.home") + File.separator + "bin" + File.separator + "java";
+
+        // Выбираем бинарник Java
+        String javaBinary = useJava8 ? java8Path : java21Path;
+
+        // Получаем classpath из classLoaderControl
+        String cp = Arrays.stream(classLoaderControl.getURLs())
+                .map(url -> new File(url.getFile()).getAbsolutePath())
+                .collect(Collectors.joining(File.pathSeparator));
+
+        List<String> command = new ArrayList<>();
+        command.add(javaBinary);
+        command.add("-cp");
+        command.add(cp);
+        command.add(params.profile.getMainClass());
+        command.addAll(args);
+
+        LogHelper.debug("Starting external process with Java: " + javaBinary);
+        ProcessBuilder pb = new ProcessBuilder(command);
+        pb.inheritIO();
+        Process process = pb.start();
+        int exitCode = process.waitFor();
+        if (exitCode != 0) {
+            LogHelper.error("Minecraft client exited with error code: " + exitCode);
+        } else {
             LogHelper.debug("Main exit successful");
-        } catch (Throwable e) {
-            LogHelper.error(e);
-            throw e;
-        } finally {
-            ClientLauncherMethods.exitLauncher(0);
         }
 
+        ClientLauncherMethods.exitLauncher(0);
     }
 
     private static final class ClassPathFileVisitor extends SimpleFileVisitor<Path> {
